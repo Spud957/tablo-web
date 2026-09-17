@@ -5,6 +5,10 @@ services:
     restart: unless-stopped
     volumes:
       - data:/data
+    # Intel iGPU for hardware transcoding; the backend probes it at startup and
+    # falls back to libx264 if it is missing or unusable.
+    devices:
+      - /dev/dri:/dev/dri
     environment:
       - PYTHONUNBUFFERED=1
     expose:

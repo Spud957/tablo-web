@@ -18,12 +18,18 @@ _lock = Lock()
 
 
 class StreamSession:
-    """Tracks a live HLS stream for one viewer."""
+    """One tuner session on the device, shared by every viewer of that channel."""
 
-    def __init__(self, stream: TabloStream, base_url: str) -> None:
+    def __init__(self, identifier: str, stream: TabloStream, base_url: str) -> None:
+        self.identifier = identifier
         self.stream = stream
         # base URL of the Tablo device (e.g. http://10.0.0.5:8885)
         self.base_url = base_url
+        # Viewer session ids sharing this tuner; the stream ends when it empties
+        self.viewers: set[str] = set()
+        # Set by the stream routes while this channel is being transcoded
+        self.transcode_id: str | None = None
+        self.keepalive_task: asyncio.Task | None = None
 
 
 class AppState:
@@ -34,6 +40,8 @@ class AppState:
         self.active_device: TabloDevice | None = None
         self._channels: list[TabloChannel] | None = None
         self.streams: dict[str, StreamSession] = {}  # session_id → session
+        self._channel_streams: dict[str, StreamSession] = {}  # identifier → session
+        self._stream_lock = asyncio.Lock()
         self._http = httpx.AsyncClient(timeout=30)
         # Grid enrichment cache — avoids re-fetching 800 airing details on every guide load
         self._grid_cache: tuple | None = None
@@ -71,7 +79,11 @@ class AppState:
         self.devices = []
         self.active_device = None
         self._channels = None
+        for sess in self._channel_streams.values():
+            if sess.keepalive_task:
+                sess.keepalive_task.cancel()
         self.streams.clear()
+        self._channel_streams.clear()
 
     # ------------------------------------------------------------------
     # Auth / discovery
@@ -126,22 +138,53 @@ class AppState:
     # ------------------------------------------------------------------
 
     async def start_stream(self, identifier: str) -> tuple[str, StreamSession]:
+        """Attach a viewer to this channel, reusing the tuner if one is open."""
         if self.active_device is None:
             raise RuntimeError("No active device")
-        client = TabloClient(self.active_device)
-        stream = await _run_sync(client.watch, identifier)
+
         session_id = uuid.uuid4().hex
 
-        # Deriving base_url from the playlist_url ensures we use the correct port
-        # for segments and nested playlists (e.g. port 80 vs 8887).
-        from urllib.parse import urlparse
-        parsed = urlparse(stream.playlist_url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        async with self._stream_lock:
+            sess = self._channel_streams.get(identifier)
+            if sess is None:
+                client = TabloClient(self.active_device)
+                stream = await _run_sync(client.watch, identifier)
 
-        sess = StreamSession(stream=stream, base_url=base_url)
-        with _lock:
-            self.streams[session_id] = sess
+                # Deriving base_url from the playlist_url ensures we use the correct port
+                # for segments and nested playlists (e.g. port 80 vs 8887).
+                from urllib.parse import urlparse
+                parsed = urlparse(stream.playlist_url)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+                sess = StreamSession(identifier=identifier, stream=stream, base_url=base_url)
+                self._channel_streams[identifier] = sess
+                if stream.keepalive:
+                    sess.keepalive_task = asyncio.create_task(self._keepalive_loop(sess))
+
+            with _lock:
+                sess.viewers.add(session_id)
+                self.streams[session_id] = sess
+
         return session_id, sess
+
+    async def _keepalive_loop(self, sess: StreamSession) -> None:
+        """Renew the device's watch grant for as long as someone is watching.
+
+        The device returns a keepalive interval only when it expects to be
+        pinged for one; without this it reclaims the tuner mid-playback and
+        the stream stops with nothing failing on our side.
+        """
+        interval = sess.stream.keepalive or 0
+        client = TabloClient(self.active_device)
+        while interval > 0:
+            await asyncio.sleep(interval)
+            if not sess.viewers:
+                return
+            try:
+                sess.stream = await _run_sync(client.watch, sess.identifier)
+            except Exception as e:
+                print(f"[keepalive] {sess.identifier} renewal failed: {type(e).__name__}: {e}")
+                return
 
     def get_session(self, session_id: str) -> StreamSession | None:
         return self.streams.get(session_id)
@@ -669,6 +712,7 @@ class AppState:
             "major": c.major,
             "minor": c.minor,
             "network": c.network,
+            "kind": c.kind,
             "display_name": c.display_name,
             "logo_url": logo_map.get(c.identifier),
             "airings": airings,
@@ -709,6 +753,7 @@ class AppState:
                 "major": c.major,
                 "minor": c.minor,
                 "network": c.network,
+                "kind": c.kind,
                 "display_name": c.display_name,
                 "logo_url": None,
                 "airings": [],
@@ -725,9 +770,29 @@ class AppState:
         for c in channels:
             yield json.dumps(self._assemble_grid_row(c, logo_map, path_to_ident, channel_to_airings, cloud_airing_map)) + "\n"
 
-    def stop_session(self, session_id: str) -> None:
+    def stop_session(self, session_id: str) -> StreamSession | None:
+        """Detach a viewer. Returns the session only if it was the last one."""
         with _lock:
-            self.streams.pop(session_id, None)
+            sess = self.streams.pop(session_id, None)
+            if sess is None:
+                return None
+            sess.viewers.discard(session_id)
+            if sess.viewers:
+                return None
+            self._channel_streams.pop(sess.identifier, None)
+        if sess.keepalive_task:
+            sess.keepalive_task.cancel()
+        return sess
+
+    def drop_stream(self, sess: StreamSession) -> None:
+        """Release a stream and every viewer attached to it."""
+        with _lock:
+            for viewer_id in sess.viewers:
+                self.streams.pop(viewer_id, None)
+            sess.viewers.clear()
+            self._channel_streams.pop(sess.identifier, None)
+        if sess.keepalive_task:
+            sess.keepalive_task.cancel()
 
     @property
     def is_authenticated(self) -> bool:

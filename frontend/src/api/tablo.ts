@@ -29,7 +29,15 @@ export interface StreamStart {
   session_id: string;
   proxy_url: string;
   stream_url: string;
+  remote_url: string;
   transcoded?: boolean;
+}
+
+export interface TranscodeStatus {
+  status: string;
+  return_code?: number | null;
+  files?: string[];
+  log: string;
 }
 
 export interface Program {
@@ -147,6 +155,11 @@ export const api = {
     return req<StreamStart>(url, { method: "POST" });
   },
 
+  // keepalive lets the request survive the page being torn down, so a phone
+  // closing the tab still releases the tuner instead of leaking the session.
   stopStream: (sessionId: string) =>
-    req<{ ok: boolean }>(`/stream/${sessionId}`, { method: "DELETE" }),
+    req<{ ok: boolean }>(`/stream/${sessionId}`, { method: "DELETE", keepalive: true }),
+
+  transcodeStatus: (sessionId: string) =>
+    req<TranscodeStatus>(`/transcode/status/${sessionId}`),
 };

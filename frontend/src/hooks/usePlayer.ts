@@ -1,6 +1,8 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import Hls from "hls.js";
 
+const MAX_RETRIES = 5;
+
 export function usePlayer(videoRef: React.RefObject<HTMLVideoElement | null>) {
   const hlsRef = useRef<Hls | null>(null);
   const nativeErrorHandler = useRef<(() => void) | null>(null);
@@ -30,10 +32,16 @@ export function usePlayer(videoRef: React.RefObject<HTMLVideoElement | null>) {
     const isSafari = !isChromeIOS && /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     const forceNative = isIOS && isSafari;
 
+    let networkRetries = 0;
+    let mediaRetries = 0;
+
     if (!forceNative && Hls.isSupported()) {
       const hls = new Hls({ 
         enableWorker: true, 
-        lowLatencyMode: true,
+        // The Tablo/FFmpeg output is plain HLS with 6s segments, not LL-HLS.
+        // Low-latency mode pins playback to the live edge, so any mobile
+        // hiccup stalls the stream with no buffer to absorb it.
+        lowLatencyMode: false,
         backBufferLength: 90,
         manifestLoadingTimeOut: 20000,
         manifestLoadingMaxRetry: 10,
@@ -58,12 +66,30 @@ export function usePlayer(videoRef: React.RefObject<HTMLVideoElement | null>) {
       });
 
       hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          setError(`HLS Fatal Error: ${data.type} - ${data.details}`);
-          hls.destroy();
-        } else {
+        if (!data.fatal) {
           console.warn("HLS Non-fatal error:", data.details);
+          return;
         }
+
+        // Mobile browsers drop segments on slow networks and when the tab is
+        // backgrounded, which hls.js reports as fatal. Reload in place instead
+        // of tearing the player down, which leaves the stream frozen for good.
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < MAX_RETRIES) {
+          networkRetries += 1;
+          console.warn(`HLS network error (${data.details}) — reloading, attempt ${networkRetries}`);
+          hls.startLoad();
+          return;
+        }
+
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < MAX_RETRIES) {
+          mediaRetries += 1;
+          console.warn(`HLS media error (${data.details}) — recovering, attempt ${mediaRetries}`);
+          hls.recoverMediaError();
+          return;
+        }
+
+        setError(`HLS Fatal Error: ${data.type} - ${data.details}`);
+        hls.destroy();
       });
 
       hlsRef.current = hls;

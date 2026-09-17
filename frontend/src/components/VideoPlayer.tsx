@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { usePlayer } from "../hooks/usePlayer";
+import { useAirPlay } from "../hooks/useAirPlay";
 import { api } from "../api/tablo";
 import type { Channel } from "../api/tablo";
 
@@ -16,7 +17,14 @@ export function VideoPlayer({ channel, onClose }: Props) {
   const [apiError, setApiError] = useState<string | null>(null);
   const [showControls, setShowControls] = useState(true);
   const [muted, setMuted] = useState(true);
+  const [transcodeLog, setTranscodeLog] = useState<string | null>(null);
+  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+  const transcoded = useRef(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout>>(null);
+
+  const { available: airPlayAvailable, active: airPlayActive, showPicker } = useAirPlay(videoRef, remoteUrl);
+  const airPlayActiveRef = useRef(false);
+  useEffect(() => { airPlayActiveRef.current = airPlayActive; }, [airPlayActive]);
 
   const combinedError = apiError || playerError;
 
@@ -29,8 +37,10 @@ export function VideoPlayer({ channel, onClose }: Props) {
     // video track is unrenderable, leaving only audio. Always transcode OTA to H.264.
     const transcode = channel.kind === "ota" ? true : undefined;
     api.startStream(channel.identifier, transcode)
-      .then(({ session_id, stream_url }) => {
+      .then(({ session_id, stream_url, remote_url, transcoded: isTranscoded }) => {
         if (cancelled) return;
+        transcoded.current = isTranscoded ?? false;
+        setRemoteUrl(remote_url);
         setSessionId(session_id);
         load(stream_url);
         setLoading(false);
@@ -54,6 +64,30 @@ export function VideoPlayer({ channel, onClose }: Props) {
       if (sessionId) api.stopStream(sessionId).catch(() => {});
     };
   }, [sessionId]);
+
+  // Mobile browsers discard backgrounded tabs without ever unmounting React, so
+  // the unmount cleanup above never runs and the tuner and transcode leak.
+  useEffect(() => {
+    if (!sessionId) return;
+    const release = () => {
+      // While an Apple TV is playing, the phone is only a remote — locking it
+      // must not tear down the stream the TV is still pulling. The idle reaper
+      // cleans up once the Apple TV stops requesting segments.
+      if (airPlayActiveRef.current) return;
+      api.stopStream(sessionId).catch(() => {});
+    };
+    window.addEventListener("pagehide", release);
+    return () => window.removeEventListener("pagehide", release);
+  }, [sessionId]);
+
+  // A transcoded stream that fails usually failed inside FFmpeg, so pull its
+  // log instead of showing only the generic HLS error.
+  useEffect(() => {
+    if (!playerError || !sessionId || !transcoded.current) return;
+    api.transcodeStatus(sessionId)
+      .then(s => setTranscodeLog(s.log || null))
+      .catch(() => {});
+  }, [playerError, sessionId]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
@@ -125,6 +159,12 @@ export function VideoPlayer({ channel, onClose }: Props) {
           {combinedError && (
             <>
               <p className="text-red-400 text-sm max-w-xs text-center">{combinedError}</p>
+              {transcodeLog && (
+                <pre className="max-w-lg max-h-40 overflow-auto rounded-lg bg-black/60 border border-white/10 p-3
+                                text-[10px] leading-relaxed text-white/40 whitespace-pre-wrap">
+                  {transcodeLog}
+                </pre>
+              )}
               <button onClick={onClose} className="px-4 py-2 rounded-lg glass text-sm hover:bg-white/10 transition">
                 Close
               </button>
@@ -164,6 +204,21 @@ export function VideoPlayer({ channel, onClose }: Props) {
           </div>
 
           <div className="flex items-center gap-2">
+            {/* AirPlay — only rendered once Safari reports a target on the network */}
+            {airPlayAvailable && (
+              <button
+                onClick={(e) => { e.stopPropagation(); showPicker(); }}
+                className={`w-9 h-9 rounded-lg glass flex items-center justify-center hover:bg-white/10 transition
+                  ${airPlayActive ? "text-accent" : ""}`}
+                title={airPlayActive ? "Playing on Apple TV" : "Play on Apple TV"}
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16.5A2.5 2.5 0 011.5 14V6A2.5 2.5 0 014 3.5h16A2.5 2.5 0 0122.5 6v8a2.5 2.5 0 01-2.5 2.5" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 14l5 6.5H7L12 14z" />
+                </svg>
+              </button>
+            )}
+
             {/* Mute/unmute */}
             <button
               onClick={(e) => { e.stopPropagation(); toggleMute(); }}

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import asynccontextmanager
 
@@ -19,7 +20,9 @@ async def lifespan(app: FastAPI):
                 await state.login(cfg["email"], cfg["password"])
         except Exception:
             pass
+    reaper = asyncio.create_task(stream.reap_idle_transcodes())
     yield
+    reaper.cancel()
     await state.http.aclose()
 
 app = FastAPI(title="Tablo Web", lifespan=lifespan)
